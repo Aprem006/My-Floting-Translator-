@@ -1,0 +1,669 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Write project files
+        run: |
+          mkdir -p app/src/main/java/com/prem/screentranslator
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "ScreenTranslator"
+          include(":app")
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          EOF_FILE
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          
+          android {
+              namespace = "com.prem.screentranslator"
+              compileSdk = 34
+          
+              defaultConfig {
+                  applicationId = "com.prem.screentranslator"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+          
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("com.google.mlkit:text-recognition:16.0.1")
+              implementation("com.google.mlkit:translate:17.0.3")
+              implementation("com.google.mlkit:language-id:17.0.6")
+          }
+          EOF_FILE
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+          
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+          
+              <application
+                  android:allowBackup="false"
+                  android:label="Screen Translator"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+          
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+          
+                  <service
+                      android:name=".TranslatorService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+              </application>
+          </manifest>
+          EOF_FILE
+          cat > app/src/main/java/com/prem/screentranslator/MainActivity.kt <<'EOF_FILE'
+          package com.prem.screentranslator
+          
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import com.google.mlkit.nl.translate.TranslateLanguage
+          import com.google.mlkit.nl.translate.Translation
+          import com.google.mlkit.nl.translate.TranslatorOptions
+          
+          class MainActivity : Activity() {
+          
+              private lateinit var status: TextView
+              private val reqOverlay = 1
+              private val reqCapture = 2
+          
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val pad = (24 * resources.displayMetrics.density).toInt()
+          
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER_HORIZONTAL
+                      setPadding(pad, pad * 2, pad, pad)
+                  }
+                  val title = TextView(this).apply {
+                      text = "Screen Translator"
+                      textSize = 26f
+                  }
+                  val sub = TextView(this).apply {
+                      text = "English \u2194 Indonesian"
+                      textSize = 16f
+                      setPadding(0, pad / 4, 0, pad)
+                  }
+                  status = TextView(this).apply {
+                      text = "Getting language packs ready..."
+                      textSize = 14f
+                      setPadding(0, 0, 0, pad)
+                  }
+                  val start = Button(this).apply {
+                      text = "Start floating button"
+                      setOnClickListener { begin() }
+                  }
+                  val stop = Button(this).apply {
+                      text = "Stop"
+                      setOnClickListener {
+                          startService(Intent(this@MainActivity, TranslatorService::class.java).setAction("STOP"))
+                      }
+                  }
+                  val help = TextView(this).apply {
+                      text = "How to use:\n1. Tap Start and allow the permissions\n2. Open any app\n3. Tap the red bubble to translate the screen\n4. Tap the translated screen to dismiss it\n5. Long-press the bubble to stop"
+                      textSize = 14f
+                      setPadding(0, pad, 0, 0)
+                  }
+                  root.addView(title)
+                  root.addView(sub)
+                  root.addView(status)
+                  root.addView(start)
+                  root.addView(stop)
+                  root.addView(help)
+                  setContentView(root)
+          
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 0)
+                  }
+                  downloadModels()
+              }
+          
+              private fun downloadModels() {
+                  var done = 0
+                  val pairs = listOf(
+                      TranslateLanguage.ENGLISH to TranslateLanguage.INDONESIAN,
+                      TranslateLanguage.INDONESIAN to TranslateLanguage.ENGLISH
+                  )
+                  for ((src, tgt) in pairs) {
+                      val tr = Translation.getClient(
+                          TranslatorOptions.Builder().setSourceLanguage(src).setTargetLanguage(tgt).build()
+                      )
+                      tr.downloadModelIfNeeded()
+                          .addOnSuccessListener {
+                              done++
+                              if (done == 2) status.text = "Language packs ready \u2713 (works offline)"
+                              tr.close()
+                          }
+                          .addOnFailureListener {
+                              status.text = "Couldn't download language packs. Check your internet and reopen the app."
+                          }
+                  }
+              }
+          
+              private fun begin() {
+                  if (!Settings.canDrawOverlays(this)) {
+                      val i = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+                      startActivityForResult(i, reqOverlay)
+                      return
+                  }
+                  askCapture()
+              }
+          
+              private fun askCapture() {
+                  val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  startActivityForResult(mgr.createScreenCaptureIntent(), reqCapture)
+              }
+          
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == reqOverlay) {
+                      if (Settings.canDrawOverlays(this)) askCapture()
+                  } else if (requestCode == reqCapture && resultCode == RESULT_OK && data != null) {
+                      val i = Intent(this, TranslatorService::class.java)
+                          .putExtra("code", resultCode)
+                          .putExtra("data", data)
+                      startForegroundService(i)
+                      moveTaskToBack(true)
+                  }
+              }
+          }
+          EOF_FILE
+          cat > app/src/main/java/com/prem/screentranslator/TranslatorService.kt <<'EOF_FILE'
+          package com.prem.screentranslator
+          
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Bitmap
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.graphics.drawable.Icon
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.Image
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.util.DisplayMetrics
+          import android.util.TypedValue
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.WindowManager
+          import android.widget.FrameLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import com.google.mlkit.nl.languageid.LanguageIdentification
+          import com.google.mlkit.nl.translate.TranslateLanguage
+          import com.google.mlkit.nl.translate.Translation
+          import com.google.mlkit.nl.translate.Translator
+          import com.google.mlkit.nl.translate.TranslatorOptions
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.text.Text
+          import com.google.mlkit.vision.text.TextRecognition
+          import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+          import kotlin.math.abs
+          
+          class TranslatorService : Service() {
+          
+              private lateinit var wm: WindowManager
+              private val main = Handler(Looper.getMainLooper())
+              private var projection: MediaProjection? = null
+              private var display: VirtualDisplay? = null
+              private var idleReader: ImageReader? = null
+              private var pendingReader: ImageReader? = null
+              private var button: TextView? = null
+              private var overlay: FrameLayout? = null
+              private var w = 0
+              private var h = 0
+              private var dpi = 0
+              private var busy = false
+          
+              private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+              private val langId = LanguageIdentification.getClient()
+              private val translators = HashMap<String, Translator>()
+          
+              override fun onBind(intent: Intent?): IBinder? = null
+          
+              override fun onCreate() {
+                  super.onCreate()
+                  wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+              }
+          
+              @Suppress("DEPRECATION")
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == "STOP") {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  startAsForeground()
+                  if (projection != null) return START_NOT_STICKY
+          
+                  val code = intent?.getIntExtra("code", 0) ?: 0
+                  val data: Intent? = if (Build.VERSION.SDK_INT >= 33) {
+                      intent?.getParcelableExtra("data", Intent::class.java)
+                  } else {
+                      intent?.getParcelableExtra("data")
+                  }
+                  if (data == null) {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+          
+                  val m = DisplayMetrics()
+                  wm.defaultDisplay.getRealMetrics(m)
+                  w = m.widthPixels
+                  h = m.heightPixels
+                  dpi = m.densityDpi
+          
+                  try {
+                      startCapture(code, data)
+                  } catch (e: Exception) {
+                      toast("Couldn't start: ${e.message}")
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  addButton()
+                  return START_NOT_STICKY
+              }
+          
+              private fun startAsForeground() {
+                  val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  nm.createNotificationChannel(
+                      NotificationChannel("st", "Screen Translator", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  val stopIntent = PendingIntent.getService(
+                      this, 0,
+                      Intent(this, TranslatorService::class.java).setAction("STOP"),
+                      PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val stopAction = Notification.Action.Builder(
+                      Icon.createWithResource(this, android.R.drawable.ic_delete), "Stop", stopIntent
+                  ).build()
+                  val n = Notification.Builder(this, "st")
+                      .setContentTitle("Screen Translator is running")
+                      .setContentText("Tap the red bubble to translate your screen")
+                      .setSmallIcon(android.R.drawable.ic_dialog_info)
+                      .addAction(stopAction)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                  } else {
+                      startForeground(1, n)
+                  }
+              }
+          
+              private fun startCapture(code: Int, data: Intent) {
+                  val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  val p = mgr.getMediaProjection(code, data)
+                  p.registerCallback(object : MediaProjection.Callback() {
+                      override fun onStop() {
+                          main.post { stopSelf() }
+                      }
+                  }, main)
+                  projection = p
+          
+                  val idle = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+                  idle.setOnImageAvailableListener({ r -> r.acquireLatestImage()?.close() }, main)
+                  idleReader = idle
+                  display = p.createVirtualDisplay(
+                      "screen-translator", w, h, dpi,
+                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, idle.surface, null, null
+                  )
+              }
+          
+              private fun addButton() {
+                  val size = dp(56)
+                  val tv = TextView(this).apply {
+                      text = "\u6587A"
+                      gravity = Gravity.CENTER
+                      setTextColor(Color.WHITE)
+                      textSize = 16f
+                      background = GradientDrawable().apply {
+                          shape = GradientDrawable.OVAL
+                          setColor(0xE6D32F2F.toInt())
+                      }
+                  }
+                  val lp = WindowManager.LayoutParams(
+                      size, size,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  lp.gravity = Gravity.TOP or Gravity.START
+                  lp.x = dp(12)
+                  lp.y = dp(240)
+          
+                  var sx = 0f
+                  var sy = 0f
+                  var ox = 0
+                  var oy = 0
+                  var moved = false
+                  var downTime = 0L
+                  tv.setOnTouchListener { v, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              sx = e.rawX
+                              sy = e.rawY
+                              ox = lp.x
+                              oy = lp.y
+                              moved = false
+                              downTime = e.eventTime
+                              true
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dx = (e.rawX - sx).toInt()
+                              val dy = (e.rawY - sy).toInt()
+                              if (abs(dx) > 12 || abs(dy) > 12) moved = true
+                              if (moved) {
+                                  lp.x = ox + dx
+                                  lp.y = oy + dy
+                                  wm.updateViewLayout(v, lp)
+                              }
+                              true
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              if (!moved) {
+                                  if (e.eventTime - downTime > 800) stopSelf() else capture()
+                              }
+                              true
+                          }
+                          else -> false
+                      }
+                  }
+                  wm.addView(tv, lp)
+                  button = tv
+              }
+          
+              private fun capture() {
+                  if (busy) return
+            busy = true
+                  removeOverlay()
+                  button?.visibility = View.INVISIBLE
+                  main.postDelayed({
+                      val reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+                      pendingReader = reader
+                      reader.setOnImageAvailableListener({ r ->
+                          val img = r.acquireLatestImage() ?: return@setOnImageAvailableListener
+                          val bmp = try {
+                              toBitmap(img)
+                          } finally {
+                              img.close()
+                          }
+                          finishCapture(reader)
+                          recognize(bmp)
+                      }, main)
+                      display?.surface = reader.surface
+                      main.postDelayed({
+                          if (pendingReader === reader) {
+                              finishCapture(reader)
+                              toast("Couldn't capture the screen, try again")
+                              busy = false
+                          }
+                      }, 3000)
+                  }, 250)
+              }
+          
+              private fun finishCapture(reader: ImageReader) {
+                  pendingReader = null
+                  reader.setOnImageAvailableListener(null, null)
+                  display?.surface = idleReader?.surface
+                  reader.close()
+                  button?.visibility = View.VISIBLE
+              }
+          
+              private fun toBitmap(img: Image): Bitmap {
+                  val p = img.planes[0]
+                  val rowPadding = p.rowStride - p.pixelStride * w
+                  val wide = Bitmap.createBitmap(w + rowPadding / p.pixelStride, h, Bitmap.Config.ARGB_8888)
+                  wide.copyPixelsFromBuffer(p.buffer)
+                  return Bitmap.createBitmap(wide, 0, 0, w, h)
+              }
+          
+              private fun recognize(bmp: Bitmap) {
+                  recognizer.process(InputImage.fromBitmap(bmp, 0))
+                      .addOnSuccessListener { t ->
+                          val blocks = t.textBlocks.filter { it.boundingBox != null && it.text.isNotBlank() }
+                          if (blocks.isEmpty()) {
+                              toast("No text found on screen")
+                              busy = false
+                              return@addOnSuccessListener
+                          }
+                          detect(t.text) { screenLang ->
+                              val def = if (screenLang == "id") "id" else "en"
+                              val results = arrayOfNulls<String>(blocks.size)
+                              var left = blocks.size
+                              blocks.forEachIndexed { i, b ->
+                                  translateAuto(b.text, def) { res ->
+                                      results[i] = res
+                                      left--
+                                      if (left == 0) showOverlay(bmp, blocks, results)
+                                  }
+                              }
+                          }
+                      }
+                      .addOnFailureListener {
+                          toast("Couldn't read the screen")
+                          busy = false
+                      }
+              }
+          
+              private fun detect(text: String, cb: (String) -> Unit) {
+                  langId.identifyLanguage(text)
+                      .addOnSuccessListener { cb(it) }
+                      .addOnFailureListener { cb("und") }
+              }
+          
+              private fun translateAuto(text: String, def: String, cb: (String?) -> Unit) {
+                  detect(text) { code ->
+                      val src = if (code == "id" || code == "en") code else def
+                      val tgt = if (src == "id") "en" else "id"
+                      translate(src, tgt, text, cb)
+                  }
+              }
+          
+              private fun translate(src: String, tgt: String, text: String, cb: (String?) -> Unit) {
+                  val key = "$src-$tgt"
+                  val tr = translators.getOrPut(key) {
+                      Translation.getClient(
+                          TranslatorOptions.Builder()
+                              .setSourceLanguage(if (src == "id") TranslateLanguage.INDONESIAN else TranslateLanguage.ENGLISH)
+                              .setTargetLanguage(if (tgt == "id") TranslateLanguage.INDONESIAN else TranslateLanguage.ENGLISH)
+                              .build()
+                      )
+                  }
+                  tr.downloadModelIfNeeded()
+                      .addOnSuccessListener {
+                          tr.translate(text)
+                              .addOnSuccessListener { cb(it) }
+                              .addOnFailureListener { cb(null) }
+                      }
+                      .addOnFailureListener { cb(null) }
+              }
+          
+              private fun showOverlay(bmp: Bitmap, blocks: List<Text.TextBlock>, results: Array<String?>) {
+                  val root = FrameLayout(this)
+                  var count = 0
+                  blocks.forEachIndexed { i, b ->
+                      val res = results[i] ?: return@forEachIndexed
+                      if (res.trim().equals(b.text.trim(), ignoreCase = true)) return@forEachIndexed
+                      val r = b.boundingBox ?: return@forEachIndexed
+                      val pad = dp(3)
+                      val left = (r.left - pad).coerceIn(0, w - 1)
+                      val top = (r.top - pad).coerceIn(0, h - 1)
+                      val bw = (r.width() + pad * 2).coerceAtMost(w - left).coerceAtLeast(dp(20))
+                      val bh = (r.height() + pad * 2).coerceAtMost(h - top).coerceAtLeast(dp(14))
+                      val bg = bmp.getPixel((r.left + 2).coerceIn(0, w - 1), (r.top + 2).coerceIn(0, h - 1))
+                      val lum = (Color.red(bg) * 299 + Color.green(bg) * 587 + Color.blue(bg) * 114) / 1000
+                      val tv = TextView(this).apply {
+                          text = res
+                          setBackgroundColor(bg)
+                          setTextColor(if (lum > 140) Color.BLACK else Color.WHITE)
+                          gravity = Gravity.CENTER_VERTICAL
+                          setPadding(dp(2), 0, dp(2), 0)
+                          setAutoSizeTextTypeUniformWithConfiguration(6, 24, 1, TypedValue.COMPLEX_UNIT_SP)
+                      }
+                      val lp = FrameLayout.LayoutParams(bw, bh)
+                      lp.leftMargin = left
+                      lp.topMargin = top
+                      root.addView(tv, lp)
+                      count++
+                  }
+                  if (count == 0) {
+                      toast("Nothing to translate")
+                      busy = false
+                      return
+                  }
+                  root.setOnClickListener { removeOverlay() }
+                  val params = WindowManager.LayoutParams(
+                      ViewGroup.LayoutParams.MATCH_PARENT,
+                      ViewGroup.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  params.gravity = Gravity.TOP or Gravity.START
+                  if (Build.VERSION.SDK_INT >= 28) {
+                      params.layoutInDisplayCutoutMode =
+                          WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                  }
+                  wm.addView(root, params)
+                  overlay = root
+                  busy = false
+              }
+          
+              private fun removeOverlay() {
+                  overlay?.let {
+                      try {
+                          wm.removeView(it)
+                      } catch (_: Exception) {
+                      }
+                  }
+                  overlay = null
+              }
+          
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+          
+              private fun toast(msg: String) {
+                  Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+              }
+          
+              override fun onDestroy() {
+                  removeOverlay()
+                  button?.let {
+                      try {
+                          wm.removeView(it)
+                      } catch (_: Exception) {
+                      }
+                  }
+                  button = null
+                  display?.release()
+                  idleReader?.close()
+                  projection?.stop()
+                  recognizer.close()
+                  translators.values.forEach { it.close() }
+                  super.onDestroy()
+              }
+          }
+          EOF_FILE
+
+      - name: Build
+        run: gradle assembleDebug --stacktrace
+
+      - name: Publish APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
